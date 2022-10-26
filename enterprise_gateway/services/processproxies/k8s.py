@@ -5,9 +5,14 @@
 import logging
 import os
 import re
+import time
+from multiprocessing import Pool
+
 import urllib3
 
 from kubernetes import client, config
+from tornado import ioloop
+from traitlets.config import SingletonConfigurable
 
 from .container import ContainerProcessProxy
 from ..sessions.kernelsessionmanager import KernelSessionManager
@@ -23,6 +28,58 @@ kernel_cluster_role = os.environ.get('EG_KERNEL_CLUSTER_ROLE', 'cluster-admin')
 share_gateway_namespace = bool(os.environ.get('EG_SHARED_NAMESPACE', 'False').lower() == 'true')
 
 config.load_incluster_config()
+logger = logging.getLogger(__name__)
+
+
+def list_namespaced_pods(namespace):
+    ret = client.CoreV1Api().list_namespaced_pod(namespace=namespace)
+    return {x.metadata.name: (x.status.phase, x.status.pod_ip, x.status.host_ip) for x in ret.items}
+
+
+class PodStatusLoader(SingletonConfigurable):
+    def __init__(self, kernel_namespace, **kwargs):
+        super().__init__(**kwargs)
+        self.namespace = kernel_namespace
+        self.pool = Pool(1, maxtasksperchild=1)
+        self.running_job = None
+        self.last_submitted = time.time()
+        self.last_regeneration = time.time()
+        self.all_pod_status = {}
+        self.call_back = ioloop.PeriodicCallback(self.submit_job, 1000)
+
+        self.call_back.start()
+        self.populate_status(list_namespaced_pods(self.namespace))
+
+    def submit_job(self):
+        if not self.running_job or self.running_job.ready():
+            if time.time() - self.last_regeneration > 300:
+                self.pool.close()
+                logger.warning("PodStatusLoader pool regenerated")
+                self.pool = Pool(1, maxtasksperchild=1)
+                self.last_regeneration = time.time()
+
+            self.running_job = self.pool.apply_async(list_namespaced_pods, args=[self.namespace],
+                                                     callback=self.populate_status, error_callback=self.err_callback)
+            self.last_submitted = time.time()
+        else:
+            logger.warning(f"PodStatusLoader job still running after {time.time() - self.last_submitted} s")
+            if time.time() - self.last_submitted > 300:
+                self.pool.close()
+                logger.warning("PodStatusLoader pool force regenerated after 5 min")
+                self.pool = Pool(1, maxtasksperchild=1)
+                self.last_regeneration = time.time()
+                self.running_job = None
+
+    def populate_status(self, status):
+        self.all_pod_status = status
+        logger.warning(f"PodStatusLoader populate_status after {time.time() - self.last_submitted} s")
+
+    def err_callback(self, error):
+        logger.error(f"PodStatusLoader Error: {error}")
+        self.running_job = None
+
+    def get_pod_status(self, pod_name):
+        return self.all_pod_status.get(pod_name, (None, None, None))
 
 
 class KubernetesProcessProxy(ContainerProcessProxy):
@@ -57,20 +114,16 @@ class KubernetesProcessProxy(ContainerProcessProxy):
         """Return current container state."""
         # Locates the kernel pod using the kernel_id selector.  If the phase indicates Running, the pod's IP
         # is used for the assigned_ip.
-        pod_status = None
-        kernel_label_selector = "kernel_id=" + self.kernel_id + ",component=kernel"
-        ret = client.CoreV1Api().list_namespaced_pod(namespace=self.kernel_namespace,
-                                                     label_selector=kernel_label_selector)
-        if ret and ret.items:
-            pod_info = ret.items[0]
-            self.container_name = pod_info.metadata.name
-            if pod_info.status:
-                pod_status = pod_info.status.phase
-                if pod_status == 'Running' and self.assigned_host == '':
-                    # Pod is running, capture IP
-                    self.assigned_ip = pod_info.status.pod_ip
-                    self.assigned_host = self.container_name
-                    self.assigned_node_ip = pod_info.status.host_ip
+
+        psl = PodStatusLoader.instance(kernel_namespace=self.kernel_namespace)
+        pod_status, pod_ip, host_ip = psl.get_pod_status(self.kernel_pod_name)
+
+        if pod_status == 'Running' and self.assigned_host == '':
+            # Pod is running, capture IP
+            self.assigned_ip = pod_ip
+            self.container_name = self.kernel_pod_name
+            self.assigned_host = self.kernel_pod_name
+            self.assigned_node_ip = host_ip
 
         if iteration:  # only log if iteration is not None (otherwise poll() is too noisy)
             self.log.debug("{}: Waiting to connect to k8s pod in namespace '{}'. "

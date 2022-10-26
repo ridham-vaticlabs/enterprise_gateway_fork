@@ -44,6 +44,7 @@ from .services.kernelspecs import KernelSpecCache
 
 from .mixins import EnterpriseGatewayConfigMixin
 
+from enterprise_gateway.authentication import init_auth
 
 # Add additional command line aliases
 aliases = dict(base_aliases)
@@ -93,6 +94,7 @@ class EnterpriseGatewayApp(EnterpriseGatewayConfigMixin, JupyterApp):
         """
         super(EnterpriseGatewayApp, self).initialize(argv)
         self.init_configurables()
+        init_auth()
         self.init_webapp()
         self.init_http_server()
 

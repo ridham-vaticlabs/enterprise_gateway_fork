@@ -7,6 +7,7 @@ import signal
 import re
 import uuid
 
+import zmq
 from tornado import web
 from ipython_genutils.py3compat import unicode_type
 from ipython_genutils.importstring import import_item
@@ -117,6 +118,12 @@ class RemoteMappingKernelManager(AsyncMappingKernelManager):
     """
     Extends the AsyncMappingKernelManager with support for managing remote kernels via the process-proxy.
     """
+
+    def __init__(self, *args, **kwargs):
+        super(RemoteMappingKernelManager, self).__init__(*args, **kwargs)
+        self.shared_context = True  # always using a shared context
+        self.context.set(zmq.MAX_SOCKETS, 1000000)
+        self.log.info(f"Set ZMQ sockets to {self.context.MAX_SOCKETS}")
 
     pending_requests = TrackPendingRequests()  # Used to enforce max-kernel limits
 
@@ -361,6 +368,12 @@ class RemoteKernelManager(EnterpriseGatewayConfigMixin, AsyncIOLoopKernelManager
         """
         self._get_process_proxy()
         self._capture_user_overrides(**kwargs)
+        kwargs["response_address"] = self.response_address
+        kwargs["port_range"] = self.port_range
+        kwargs["kernel_id"] = self.kernel_id
+        kwargs["launch_k8s_path"] = os.path.dirname(self.kernel_spec.argv[1])
+        kwargs["kernel_name"] = self.kernel_name
+
         await super(RemoteKernelManager, self).start_kernel(**kwargs)
 
     def _capture_user_overrides(self, **kwargs):

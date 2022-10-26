@@ -10,6 +10,9 @@ import getpass
 import json
 import logging
 import os
+from multiprocessing import Pool
+from multiprocessing.pool import ApplyResult
+
 import paramiko
 import pexpect
 import random
@@ -24,9 +27,11 @@ from socket import timeout, socket, gethostbyname, gethostname, AF_INET, SOCK_ST
 from tornado import web
 from calendar import timegm
 from ipython_genutils.py3compat import with_metaclass
-from jupyter_client import launch_kernel, localinterfaces
+from jupyter_client import localinterfaces
 from notebook import _tz
 from zmq.ssh import tunnel
+
+from .launch_kubernetes import launch_kubernetes_kernel
 
 try:
     from Cryptodome.Cipher import AES
@@ -68,6 +73,9 @@ remote_pwd = None
 # some may have their IPs appear the local interfaces list (e.g., docker's 172.17.0.* is an example)
 # that should not be used.  This env can be used to indicate such IPs.
 prohibited_local_ips = os.getenv('EG_PROHIBITED_LOCAL_IPS', '').split(',')
+num_processes = os.getenv("EG_NUM_STARTER_THREADS", os.cpu_count())
+process_pool = Pool(int(num_processes), maxtasksperchild=1)
+current_age = 0
 
 
 def _get_local_ip():
@@ -214,10 +222,34 @@ class BaseProcessProxyABC(with_metaclass(abc.ABCMeta, object)):
         This method exists to allow process proxies to perform any final preparations for
         launch, including the removal of any arguments that are not recoginized by Popen.
         """
+        global current_age, process_pool
 
         # Remove kernel_headers
         kwargs.pop('kernel_headers', None)
-        return launch_kernel(cmd, **kwargs)
+        kernel_id = kwargs.pop("kernel_id")
+        port_range = kwargs.pop("port_range")
+        response_addr = kwargs.pop("response_address")
+        spark_context_init_mode = None
+        kernel_name = kwargs.pop("kernel_name")
+        j2_file_base = kwargs.pop("launch_k8s_path")
+        envs = kwargs.get("env")
+
+        # if current_age >= 300:
+        #     process_pool.close()
+        #     self.log.warning("process_pool pool regenerated")
+        #     process_pool = Pool(1, maxtasksperchild=1)
+        #     current_age = 0
+
+        # future = process_pool.apply_async(launch_kubernetes_kernel,
+        #                    args=[kernel_id, port_range, response_addr, spark_context_init_mode,
+        #                          kernel_name, j2_file_base, envs])
+
+        launch_kubernetes_kernel(kernel_id, port_range, response_addr, spark_context_init_mode,
+                                 kernel_name, j2_file_base, envs)
+
+        current_age += 1
+
+        return ApplyResult(process_pool, None, None)
 
     def cleanup(self):
         """Performs optional cleanup after kernel is shutdown.  Child classes are responsible for implementations."""
@@ -740,13 +772,22 @@ class RemoteProcessProxy(with_metaclass(abc.ABCMeta, BaseProcessProxyABC)):
         # code in such cases).  If a fault was encountered, raise server error (500) with a message
         # indicating to check the EG log for more information.
         if self.local_proc:
-            poll_result = self.local_proc.poll()
-            if poll_result and poll_result > 0:
-                self.local_proc.wait()
-                error_message = "Error occurred during launch of KernelID: {}.  " \
-                                "Check Enterprise Gateway log for more information.".format(self.kernel_id)
-                self.local_proc = None
-                self.log_and_raise(http_status_code=500, reason=error_message)
+            if isinstance(self.local_proc, subprocess.Popen):
+                poll_result = self.local_proc.poll()
+                if poll_result and poll_result > 0:
+                    self.local_proc.wait()
+                    error_message = "Error occurred during launch of KernelID: {}.  " \
+                                    "Check Enterprise Gateway log for more information.".format(self.kernel_id)
+                    self.local_proc = None
+                    self.log_and_raise(http_status_code=500, reason=error_message)
+
+            if isinstance(self.local_proc, ApplyResult):
+                if self.local_proc.ready() and not self.local_proc.successful():
+                    error_message = "Error occurred during launch of KernelID: {}.  " \
+                                    "Check Enterprise Gateway log for more information.".format(self.kernel_id)
+                    self.local_proc = None
+                    self.log_and_raise(http_status_code=500, reason=error_message)
+
 
     def _prepare_response_socket(self):
         """

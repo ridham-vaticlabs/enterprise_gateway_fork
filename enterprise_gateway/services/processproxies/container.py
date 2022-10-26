@@ -79,7 +79,7 @@ class ContainerProcessProxy(RemoteProcessProxy):
         await super(ContainerProcessProxy, self).launch_process(kernel_cmd, **kwargs)
 
         self.local_proc = self.launch_kernel(kernel_cmd, **kwargs)
-        self.pid = self.local_proc.pid
+        self.pid = 0
         self.ip = local_ip
 
         self.log.info("{}: kernel launched. Kernel image: {}, KernelID: {}, cmd: '{}'"

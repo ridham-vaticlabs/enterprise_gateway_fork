@@ -15,6 +15,8 @@ from tornado.log import LogFormatter
 from traitlets import default, List, Set, Unicode, Type, Instance, Bool, CBool, Integer, observe
 from traitlets.config import Configurable
 
+from enterprise_gateway.authentication import check_membership
+
 
 class CORSMixin(object):
     """
@@ -59,8 +61,7 @@ class TokenAuthorizationMixin(object):
     """Mixes token auth into tornado.web.RequestHandlers and
     tornado.websocket.WebsocketHandlers.
     """
-    header_prefix = "token "
-    header_prefix_len = len(header_prefix)
+    header_prefixes = ["token ", "Bearer "]
 
     def prepare(self):
         """Ensures the correct auth token is present, either as a parameter
@@ -76,18 +77,22 @@ class TokenAuthorizationMixin(object):
         with the `@web.authenticated` decorated methods in the notebook
         package.
         """
-        server_token = self.settings.get('eg_auth_token')
-        if server_token and not self.request.method == 'OPTIONS':
-            client_token = self.get_argument('token', None)
-            if client_token is None:
-                client_token = self.request.headers.get('Authorization')
-                if client_token and client_token.startswith(self.header_prefix):
-                    client_token = client_token[self.header_prefix_len:]
-                else:
-                    client_token = None
-            if client_token != server_token:
-                return self.send_error(401)
-        return super(TokenAuthorizationMixin, self).prepare()
+        if self.request.method == "OPTIONS":
+            return super(TokenAuthorizationMixin, self).prepare()
+
+        client_token = self.get_argument("token", None)
+        if client_token is None:
+            client_token = self.request.headers.get("Authorization")
+            for header_prefix in self.header_prefixes:
+                if client_token and client_token.startswith(header_prefix):
+                    header_prefix_len = len(header_prefix)
+                    client_token = client_token[header_prefix_len:]
+
+        if client_token and check_membership(client_token):
+            return super(TokenAuthorizationMixin, self).prepare()
+
+        return self.send_error(401)
+
 
 
 class JSONErrorsMixin(object):
