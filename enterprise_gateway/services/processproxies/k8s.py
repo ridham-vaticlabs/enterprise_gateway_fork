@@ -1,11 +1,13 @@
 # Copyright (c) Jupyter Development Team.
 # Distributed under the terms of the Modified BSD License.
 """Code related to managing kernels running in Kubernetes clusters."""
-
+import json
 import logging
 import os
+import random
 import re
 import time
+from concurrent.futures import ProcessPoolExecutor, Future
 from multiprocessing import Pool
 
 import urllib3
@@ -32,51 +34,38 @@ logger = logging.getLogger(__name__)
 
 
 def list_namespaced_pods(namespace):
-    ret = client.CoreV1Api().list_namespaced_pod(namespace=namespace)
-    return {x.metadata.name: (x.status.phase, x.status.pod_ip, x.status.host_ip) for x in ret.items}
+    ret = client.CoreV1Api().list_namespaced_pod(namespace=namespace, _preload_content=False, _request_timeout=10)
+    ret = json.loads(ret.data)
+    ret = {x["metadata"]["name"]: (x["status"]["phase"], x["status"].get("podIP"), x["status"].get("hostIP")) for x in ret["items"]}
+    return ret
 
 
 class PodStatusLoader(SingletonConfigurable):
     def __init__(self, kernel_namespace, **kwargs):
         super().__init__(**kwargs)
         self.namespace = kernel_namespace
-        self.pool = Pool(1, maxtasksperchild=1)
+        self.pool = ProcessPoolExecutor(1)
         self.running_job = None
         self.last_submitted = time.time()
-        self.last_regeneration = time.time()
         self.all_pod_status = {}
-        self.call_back = ioloop.PeriodicCallback(self.submit_job, 1000)
+        self.periodic_call_back = ioloop.PeriodicCallback(self.submit_job, 1000)
 
-        self.call_back.start()
-        self.populate_status(list_namespaced_pods(self.namespace))
+        self.periodic_call_back.start()
+        self.submit_job()
 
-    def submit_job(self):
-        if not self.running_job or self.running_job.ready():
-            if time.time() - self.last_regeneration > 300:
-                self.pool.close()
-                logger.warning("PodStatusLoader pool regenerated")
-                self.pool = Pool(1, maxtasksperchild=1)
-                self.last_regeneration = time.time()
-
-            self.running_job = self.pool.apply_async(list_namespaced_pods, args=[self.namespace],
-                                                     callback=self.populate_status, error_callback=self.err_callback)
+    async def submit_job(self):
+        if not self.running_job or self.running_job.done():
+            self.running_job = self.pool.submit(list_namespaced_pods, self.namespace)
+            self.running_job.add_done_callback(self.populate_status)
             self.last_submitted = time.time()
-        else:
-            logger.warning(f"PodStatusLoader job still running after {time.time() - self.last_submitted} s")
-            if time.time() - self.last_submitted > 300:
-                self.pool.close()
-                logger.warning("PodStatusLoader pool force regenerated after 5 min")
-                self.pool = Pool(1, maxtasksperchild=1)
-                self.last_regeneration = time.time()
-                self.running_job = None
 
     def populate_status(self, status):
-        self.all_pod_status = status
-        logger.warning(f"PodStatusLoader populate_status after {time.time() - self.last_submitted} s")
-
-    def err_callback(self, error):
-        logger.error(f"PodStatusLoader Error: {error}")
-        self.running_job = None
+        if isinstance(status, Future):
+            self.all_pod_status = status.result()
+        else:
+            self.all_pod_status = status
+        if random.randint(0, 60) == random.randint(0, 60):
+            logger.warning(f"PodStatusLoader populate_status took {time.time() - self.last_submitted}s")
 
     def get_pod_status(self, pod_name):
         return self.all_pod_status.get(pod_name, (None, None, None))
@@ -128,7 +117,7 @@ class KubernetesProcessProxy(ContainerProcessProxy):
         if iteration:  # only log if iteration is not None (otherwise poll() is too noisy)
             self.log.debug("{}: Waiting to connect to k8s pod in namespace '{}'. "
                            "Name: '{}', Status: '{}', Pod IP: '{}', KernelID: '{}'".
-                           format(iteration, self.kernel_namespace, self.container_name, pod_status,
+                           format(iteration, self.kernel_namespace, self.kernel_pod_name, pod_status,
                                   self.assigned_ip, self.kernel_id))
 
         return pod_status
@@ -159,13 +148,13 @@ class KubernetesProcessProxy(ContainerProcessProxy):
             else:
                 v1_status = client.CoreV1Api().delete_namespaced_pod(namespace=self.kernel_namespace,
                                                                      body=body, name=self.container_name)
-            if v1_status and v1_status.status:
+            if v1_status and v1_status.status.phase:
                 termination_stati = ['Succeeded', 'Failed', 'Terminating']
-                if any(status in v1_status.status for status in termination_stati):
+                if v1_status.status.phase in termination_stati:
                     result = True
 
             if not result:
-                self.log.warning("Unable to delete {}: {}".format(object_name, v1_status))
+                self.log.warning("Unable to delete {}: {}".format(object_name, self.container_name))
         except Exception as err:
             if isinstance(err, client.rest.ApiException) and err.status == 404:
                 result = True  # okay if its not found
