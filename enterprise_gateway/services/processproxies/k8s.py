@@ -122,6 +122,29 @@ class KubernetesProcessProxy(ContainerProcessProxy):
 
         return pod_status
 
+    def get_termination_status(self):
+        kernel_label_selector = "kernel_id=" + self.kernel_id + ",component=kernel"
+        ret = client.CoreV1Api().list_namespaced_pod(namespace=self.kernel_namespace,
+                                                     label_selector=kernel_label_selector,
+                                                     _preload_content=False, _request_timeout=10)
+        ret = json.loads(ret.data)
+        ret = ret["items"][0] if len(ret.get("items", [])) else {}
+        logger.warning(ret)
+
+        status = ret.get("status", {})
+        if status.get("kill_reason"):
+            return status.get("kill_reason"), status.get("message")
+
+        cs = status.get("containerStatuses", [])
+        for x in cs:
+            if x.get('name') == self.container_name:
+                reason = x.get("state", {}).get("terminated", {}).get("reason")
+                message = x.get("state", {}).get("terminated", {}).get("message")
+
+                return reason, message
+
+        return None, None
+
     def terminate_container_resources(self):
         """Terminate any artifacts created on behalf of the container's lifetime."""
         # Kubernetes objects don't go away on their own - so we need to tear down the namespace
