@@ -733,6 +733,7 @@ class RemoteProcessProxy(with_metaclass(abc.ABCMeta, BaseProcessProxyABC)):
         self.start_time = None
         self.assigned_ip = None
         self.assigned_host = ''
+        self.node_name = None
         self.comm_ip = None
         self.comm_port = 0
         self.tunneled_connect_info = None    # Contains the destination connection info when tunneling in use

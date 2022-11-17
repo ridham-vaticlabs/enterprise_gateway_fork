@@ -8,13 +8,17 @@ import re
 import uuid
 
 import zmq
+
 from tornado import web
 from ipython_genutils.py3compat import unicode_type
 from ipython_genutils.importstring import import_item
+
+from notebook._tz import isoformat
 from notebook.services.kernels.kernelmanager import AsyncMappingKernelManager
 from jupyter_client.ioloop.manager import AsyncIOLoopKernelManager
 from traitlets import directional_link, log as traitlets_log
 
+from ..processproxies.k8s import KubernetesProcessProxy
 from ..processproxies.processproxy import LocalProcessProxy, RemoteProcessProxy
 from ..sessions.kernelsessionmanager import KernelSessionManager
 from enterprise_gateway.mixins import EnterpriseGatewayConfigMixin
@@ -289,6 +293,26 @@ class RemoteMappingKernelManager(AsyncMappingKernelManager):
         """
 
         return new_kernel_id(kernel_id_fn=super(RemoteMappingKernelManager, self).new_kernel_id, log=self.log, **kwargs)
+
+    def kernel_model(self, kernel_id):
+        """Return a JSON-safe dict representing a kernel
+        For use in representing kernels in the JSON APIs.
+        """
+        self._check_kernel_id(kernel_id)
+        kernel = self._kernels[kernel_id]
+
+        model = {
+            "id": kernel_id,
+            "name": kernel.kernel_name,
+            "last_activity": isoformat(kernel.last_activity),
+            "execution_state": kernel.execution_state,
+            "connections": self._kernel_connections[kernel_id],
+        }
+        if isinstance(kernel.process_proxy, KubernetesProcessProxy):
+            model["pod_name"]: kernel.process_proxy.kernel_pod_name
+            model["node_name"]: kernel.process_proxy.node_name
+
+        return model
 
 
 class RemoteKernelManager(EnterpriseGatewayConfigMixin, AsyncIOLoopKernelManager):

@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 def list_namespaced_pods(namespace):
     ret = client.CoreV1Api().list_namespaced_pod(namespace=namespace, _preload_content=False, _request_timeout=10)
     ret = json.loads(ret.data)
-    ret = {x["metadata"]["name"]: (x["status"]["phase"], x["status"].get("podIP"), x["status"].get("hostIP")) for x in ret["items"]}
+    ret = {x["metadata"]["name"]: (x["status"]["phase"], x["status"].get("podIP"), x["status"].get("hostIP"), x["spec"].get("nodeName")) for x in ret["items"]}
     return ret
 
 
@@ -68,7 +68,7 @@ class PodStatusLoader(SingletonConfigurable):
             logger.warning(f"PodStatusLoader populate_status took {time.time() - self.last_submitted}s")
 
     def get_pod_status(self, pod_name):
-        return self.all_pod_status.get(pod_name, (None, None, None))
+        return self.all_pod_status.get(pod_name, (None, None, None, None))
 
 
 class KubernetesProcessProxy(ContainerProcessProxy):
@@ -105,13 +105,14 @@ class KubernetesProcessProxy(ContainerProcessProxy):
         # is used for the assigned_ip.
 
         psl = PodStatusLoader.instance(kernel_namespace=self.kernel_namespace)
-        pod_status, pod_ip, host_ip = psl.get_pod_status(self.kernel_pod_name)
+        pod_status, pod_ip, host_ip, node_name = psl.get_pod_status(self.kernel_pod_name)
 
         if pod_status == 'Running' and self.assigned_host == '':
             # Pod is running, capture IP
             self.assigned_ip = pod_ip
             self.container_name = self.kernel_pod_name
             self.assigned_host = self.kernel_pod_name
+            self.node_name = node_name
             self.assigned_node_ip = host_ip
 
         if iteration:  # only log if iteration is not None (otherwise poll() is too noisy)
