@@ -9,13 +9,48 @@ import os
 import ssl
 import traceback
 
+import google.auth.transport.requests
+from google.oauth2 import id_token
+import requests
+from requests.adapters import HTTPAdapter, Retry
 from tornado import web
 from tornado.log import LogFormatter
 
 from traitlets import default, List, Set, Unicode, Type, Instance, Bool, CBool, Integer, observe
 from traitlets.config import Configurable
 
-from enterprise_gateway.authentication import check_membership
+
+def make_http_request():
+    session_object = requests.Session()
+    retries = Retry(
+        total=5, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504]
+    )
+    session_object.mount("http://", HTTPAdapter(max_retries=retries))
+    session_object.mount("https://", HTTPAdapter(max_retries=retries))
+
+    return google.auth.transport.requests.Request(session=session_object)
+
+
+def validate_iap_jwt(iap_jwt, expected_audience):
+    """Validate an IAP JWT.
+
+    Args:
+      iap_jwt: The contents of the X-Goog-IAP-JWT-Assertion header.
+      expected_audience: The Signed Header JWT audience. See
+          https://cloud.google.com/iap/docs/signed-headers-howto
+          for details on how to get this value.
+
+    Returns:
+      (user_id, user_email, error_str).
+    """
+
+    try:
+        decoded_jwt = id_token.verify_token(
+            iap_jwt, requests.Request(), audience=expected_audience,
+            certs_url='https://www.gstatic.com/iap/verify/public_key')
+        return (decoded_jwt['sub'], decoded_jwt['email'], '')
+    except Exception as e:
+        return (None, None, '**ERROR: JWT validation error {}**'.format(e))
 
 
 class CORSMixin(object):
@@ -61,7 +96,8 @@ class TokenAuthorizationMixin(object):
     """Mixes token auth into tornado.web.RequestHandlers and
     tornado.websocket.WebsocketHandlers.
     """
-    header_prefixes = ["token ", "Bearer "]
+
+    VALID_SCOPE = os.getenv("VALID_IAP_AUD_CLAIM")
 
     def prepare(self):
         """Ensures the correct auth token is present, either as a parameter
@@ -77,19 +113,16 @@ class TokenAuthorizationMixin(object):
         with the `@web.authenticated` decorated methods in the notebook
         package.
         """
-        if self.request.method == "OPTIONS":
+        if self.request.method == "OPTIONS" or not self.VALID_SCOPE:
             return super(TokenAuthorizationMixin, self).prepare()
 
-        client_token = self.get_argument("token", None)
-        if client_token is None:
-            client_token = self.request.headers.get("Authorization")
-            for header_prefix in self.header_prefixes:
-                if client_token and client_token.startswith(header_prefix):
-                    header_prefix_len = len(header_prefix)
-                    client_token = client_token[header_prefix_len:]
+        client_jwt = self.request.headers.get("X-Goog-Iap-Jwt-Assertion")
 
-        if client_token and check_membership(client_token):
-            return super(TokenAuthorizationMixin, self).prepare()
+        if client_jwt:
+            sub, email, error = validate_iap_jwt(client_jwt, self.VALID_SCOPE)
+            if not error:
+                print(sub, email)
+                return super(TokenAuthorizationMixin, self).prepare()
 
         return self.send_error(401)
 
