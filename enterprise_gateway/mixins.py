@@ -19,6 +19,10 @@ from tornado.log import LogFormatter
 from traitlets import default, List, Set, Unicode, Type, Instance, Bool, CBool, Integer, observe
 from traitlets.config import Configurable
 
+import logging
+
+logger = logging.getLogger()
+
 
 def make_http_request():
     session_object = requests.Session()
@@ -46,11 +50,12 @@ def validate_iap_jwt(iap_jwt, expected_audience):
 
     try:
         decoded_jwt = id_token.verify_token(
-            iap_jwt, requests.Request(), audience=expected_audience,
+            iap_jwt, make_http_request(), audience=expected_audience,
             certs_url='https://www.gstatic.com/iap/verify/public_key')
-        return (decoded_jwt['sub'], decoded_jwt['email'], '')
+        return decoded_jwt['sub'], decoded_jwt['email'], ''
     except Exception as e:
-        return (None, None, '**ERROR: JWT validation error {}**'.format(e))
+        logger.warning(f"Unauthorized user {iap_jwt} for claim {expected_audience}")
+        return None, None, '**ERROR: JWT validation error {}**'.format(e)
 
 
 class CORSMixin(object):
@@ -113,7 +118,10 @@ class TokenAuthorizationMixin(object):
         with the `@web.authenticated` decorated methods in the notebook
         package.
         """
-        if self.request.method == "OPTIONS" or not self.VALID_SCOPE:
+        if self.request.method == "OPTIONS":
+            return super(TokenAuthorizationMixin, self).prepare()
+
+        if not self.VALID_SCOPE or self.VALID_SCOPE == "":
             return super(TokenAuthorizationMixin, self).prepare()
 
         client_jwt = self.request.headers.get("X-Goog-Iap-Jwt-Assertion")
@@ -127,11 +135,11 @@ class TokenAuthorizationMixin(object):
         return self.send_error(401)
 
 
-
 class JSONErrorsMixin(object):
     """Mixes `write_error` into tornado.web.RequestHandlers to respond with
     JSON format errors.
     """
+
     def write_error(self, status_code, **kwargs):
         """Responds with an application/json error object.
 
@@ -319,6 +327,7 @@ class EnterpriseGatewayConfigMixin(Configurable):
     @default('max_age')
     def max_age_default(self):
         return os.getenv(self.max_age_env, os.getenv('KG_MAX_AGE', ''))
+
     # End CORS headers
 
     max_kernels_env = 'EG_MAX_KERNELS'
